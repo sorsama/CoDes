@@ -31,7 +31,7 @@ jobs:
       - run: npm run check --workspace @codes/signaling
       - run: npm run build --workspace @codes/signaling
       - run: cargo test --manifest-path src-tauri/Cargo.toml
-      - run: npm run tauri build -- --no-bundle
+      - run: node scripts/tauri.mjs build --no-bundle
 
   relay-image:
     runs-on: ubuntu-latest
