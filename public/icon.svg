@@ -1,0 +1,23 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none"
+     xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Simple abstract coding agents logo</title>
+  <desc id="desc">A minimal black-and-white abstract tunnel made from a few skewed triangular frames.</desc>
+
+  <rect width="512" height="512" fill="#FFFFFF"/>
+
+  <!-- Outer abstract frame -->
+  <path d="M72 400L132 112L438 252L332 424Z"
+        fill="none" stroke="#000000" stroke-width="18" stroke-linejoin="miter"/>
+
+  <!-- Middle frame -->
+  <path d="M132 360L176 162L388 258L306 378Z"
+        fill="none" stroke="#000000" stroke-width="14" stroke-linejoin="miter"/>
+
+  <!-- Inner frame -->
+  <path d="M190 320L216 208L338 262L280 334Z"
+        fill="none" stroke="#000000" stroke-width="12" stroke-linejoin="miter"/>
+
+  <!-- Central opening -->
+  <path d="M232 290L246 238L304 264L272 302Z"
+        fill="#000000"/>
+</svg>
