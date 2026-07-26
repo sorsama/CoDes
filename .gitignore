@@ -16,7 +16,7 @@ src-tauri/.dev-target
 .env
 .env.*
 !.env.example
-.reasonix
+.reasonix/
 
 # OS and build artifacts
 Thumbs.db
@@ -34,5 +34,3 @@ Desktop.ini
 *.njsproj
 *.sln
 *.sw?
-/.reasonix
-/.reasonix
