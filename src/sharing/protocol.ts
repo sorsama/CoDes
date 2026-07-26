@@ -25,12 +25,12 @@ const bytesToBase64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes))
 const base64ToBytes = (value: string) => Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
 
 async function deriveKey(secret: Uint8Array) {
-  const material = await crypto.subtle.importKey("raw", secret, "HKDF", false, ["deriveKey"]);
+  const material = await crypto.subtle.importKey("raw", new Uint8Array(secret), "HKDF", false, ["deriveKey"]);
   return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode("codes-share-v1"), info: new TextEncoder().encode("signaling") }, material, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
 }
 
 export async function roomIdentity(secret: Uint8Array) {
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", secret));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(secret)));
   return bytesToBase64(digest).replace(/[+/=]/g, "").slice(0, 28);
 }
 

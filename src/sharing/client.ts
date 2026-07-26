@@ -7,7 +7,7 @@ const fromBase64Url = (value: string) => Uint8Array.from(atob(value.replace(/-/g
 export const createInvite = (secret: Uint8Array) => `codes://share/${toBase64Url(secret)}`;
 export const parseInvite = (invite: string) => { const url = new URL(invite); if (url.protocol !== "codes:" || url.hostname !== "share") throw new Error("This is not a CoDes sharing invitation."); return fromBase64Url(url.pathname.replace(/^\//, "")); };
 export const inviteRoomIdentity = (invite: string) => roomIdentity(parseInvite(invite));
-export async function confirmationPin(secret: Uint8Array) { const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", secret)); return String(((digest[0] << 16) | (digest[1] << 8) | digest[2]) % 1_000_000).padStart(6, "0"); }
+export async function confirmationPin(secret: Uint8Array) { const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(secret))); return String(((digest[0] << 16) | (digest[1] << 8) | digest[2]) % 1_000_000).padStart(6, "0"); }
 
 export type ShareSnapshot = { role: "host" | "guest"; state: ShareConnectionState; invite?: string; pin?: string; permission: SharePermission; peerConnected: boolean; error?: string; output: string };
 type Listener = (snapshot: ShareSnapshot) => void;
