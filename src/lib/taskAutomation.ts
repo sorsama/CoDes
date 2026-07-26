@@ -1,6 +1,7 @@
 import { useCoDesStore } from "../store";
 import type { BoardTask, Provider, SessionMode } from "../types";
 import { sessionRuntime } from "./sessionRuntime";
+import { dispatchWorkflowTask } from "./workflowAutomation";
 
 export function autonomousTaskPrompt(task: BoardTask, mode: SessionMode) {
   const modeInstruction =
@@ -61,4 +62,17 @@ export async function dispatchBoardTask(
     });
     throw error;
   }
+}
+
+export async function dispatchTask(
+  taskId: string,
+  overrides: { provider?: Provider; mode?: SessionMode; model?: string } = {},
+) {
+  const task = useCoDesStore
+    .getState()
+    .tasks.find((item) => item.id === taskId);
+  if (!task) throw new Error("Task no longer exists.");
+  return task.executionKind === "workflow"
+    ? dispatchWorkflowTask(taskId, task.workflowRunId)
+    : dispatchBoardTask(taskId, overrides);
 }

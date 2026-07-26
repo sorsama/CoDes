@@ -15,8 +15,13 @@ CoDes is an open-source, cross-platform desktop workspace for running many codin
 - Tabs, split panes, swarm layout, terminal search/links, session status, dashboards, Kanban drag and drop, inspector, alerts, settings, and provider detection.
 - Session launch profiles expose interactive approval, workspace auto, read-only plan, and explicit full-access modes, plus optional provider model overrides.
 - Task-board Autopilot runs Ready cards as provider-native one-shot jobs, respects per-task provider/mode/model settings and a configurable parallel-worker limit, then moves cards to Done only after a successful process exit.
+- Reusable multi-CLI workflows run ordered provider stages with structured artifacts, crash retries, verification-driven repair cycles, interruption recovery, live evidence, and contained Markdown reports. The built-in flow uses Codex to plan, Antigravity to implement, and Reasonix `run` to verify.
+- Workflow templates and individual tasks can configure stage roles, providers, models, modes, prompts, timeouts, retries, executable paths, argument arrays, and non-secret or session-only environment overrides.
 - Registry-driven provider adapters: each agent CLI is one entry in `src-tauri/src/lib.rs` (launch/resume/detection) plus one entry in `src/lib/providers.ts` (label, icon, color, install, docs).
 - Cross-provider handoff previews import structured Codex, Claude, OpenCode, Grok, and Pi conversations when available, with a bounded CoDes terminal capture for other providers. Users choose conversation-only, full-visible, or recent context before it is sent.
+- First-class Git workbench with file and hunk staging, safe commits and synchronization, branches, stashes, tags, remotes, conflict recovery, and authenticated GitHub pull requests.
+- AI Git proposals reuse any installed provider in read-only planning mode, bind actions to the exact reviewed diff, and support Verify first or bounded Full auto execution.
+- Inspector stores normalized token and cost evidence in SQLite, reads verified local CLI records, and optionally connects official OpenAI, Anthropic, GitHub, and Google usage sources.
 - Isolated Tauri child-webview adapter plus safe iframe fallback for browser preview and same-origin element capture.
 - Versioned AES-GCM encrypted WebRTC signaling protocol with permission-aware terminal channels.
 - Self-hostable, memory-only WebSocket relay with expiry, payload limits, validation, and rate limiting.
@@ -67,6 +72,8 @@ npm run build
 ## Security boundaries
 
 - Provider credentials remain owned by their CLIs.
+- Optional usage admin keys live in the operating-system credential vault; workspace snapshots retain only non-secret connector metadata.
+- Git commands use structured arguments inside a validated repository root. Force push, hard reset, automatic conflict resolution, and silent inclusion of unreviewed files are intentionally unavailable.
 - Provider history files are read-only inputs. Handoff previews exclude hidden/system records, redact likely credentials by default, and clearly report unavailable, ambiguous, malformed, or permission-denied history instead of guessing.
 - Remote pages are loaded in isolated webviews without a general application IPC bridge.
 - Session invites use random room secrets; signaling content is encrypted before reaching the relay.
@@ -78,14 +85,27 @@ The updater plugin is intentionally disabled in development. Before enabling it 
 
 ## Architecture
 
-```text
-React workspace ── typed Tauri commands/channels ── Rust core
-      │                                            ├─ PTY session manager
-      │                                            ├─ SQLite migrations
-      │                                            └─ provider diagnostics
-      ├─ xterm.js terminals
-      ├─ child-webview browser adapter
-      └─ encrypted WebRTC peer ── opaque WS relay ── peer
+```mermaid
+flowchart LR
+    subgraph Frontend[React workspace]
+        X[xterm.js terminals]
+        W[child-webview browser adapter]
+        WebRTC[encrypted WebRTC peer]
+    end
+
+    subgraph Backend[Rust core]
+        PTY[PTY session manager]
+        SQL[SQLite migrations]
+        PD[provider diagnostics]
+    end
+
+    subgraph Relay[opaque WS relay]
+        R[relay]
+    end
+
+    Frontend -- typed Tauri commands/channels --> Backend
+    WebRTC -- encrypted --- R
+    R --- P2[peer]
 ```
 
 ## Feature acceptance matrix
@@ -95,15 +115,25 @@ React workspace ── typed Tauri commands/channels ── Rust core
 | Project dashboard and widgets | Responsive overview, readiness, sessions, task flow, GitHub pulse, actions | UI build and visual smoke |
 | Multi-project workspaces | Searchable switcher, local image icons, project moving, ordering, duplication, archive/delete safeguards | Store/icon tests and responsive visual smoke |
 | Kanban | Persistent tasks, tags, four columns, drag/drop, linked-session state | Typecheck and interaction smoke |
+| Multi-CLI workflows | Editable templates, task overrides, sequential stages, repair loops, reports, pause/cancel/resume | Model/store tests, Rust command tests, and installed-provider smoke |
+| Git workbench | Diffs, file/hunk staging, commits, refs, synchronization, conflicts, PRs, and provider-generated commit proposals | Temporary-repository Rust tests, proposal tests, and native smoke |
 | Multi-session PTY | Tabs, split, swarm, binary streaming, input, resize, stop | Rust compile plus native smoke |
 | Provider support | Codex, Claude, Antigravity, OpenCode, Reasonix, Grok, Qwen, Aider, Pi detection/start/resume adapters | Installed CLI matrix |
-| Session telemetry | Normalized status model, timeline, truthful optional cost/context | Fixture tests to be expanded per CLI release |
+| Usage Inspector | Normalized local/official token and cost evidence, source freshness, filters, exports, vault-backed connectors, and budget alerts | Parser fixtures, connector mocks, native credential smoke, and rendered QA |
 | Browser preview | Isolated child webview and same-origin inspector fallback | Native engine matrix |
 | Live sharing | AES-GCM signaling, WebRTC data channel, host write gate, expiring relay | Protocol tests and two-peer smoke |
 | Theme Studio | Semantic tokens, presets, live editing, duplication, import/export | Typecheck and visual regression |
 | Packaging | Windows, macOS, Linux CI and signed release workflow | CI matrix |
 
 CoDes is an independent project and is not affiliated with OpenAI, Anthropic, Google, xAI, DeepSeek, Alibaba, Earendil, or Vibeyard.
+
+## Documentation
+
+Comprehensive documentation for users and developers is available in the [docs/](docs/README.md) folder:
+
+- **User guides** — quickstart, projects, sessions, provider setup, Git workbench, tasks, workflows, usage inspector, sharing, themes, browser preview, settings
+- **Developer docs** — architecture, source layout, adding providers, Rust backend, frontend, database schema, IPC commands, testing, signaling relay
+- **Reference** — FAQ, glossary, security model, changelog
 
 ## Contributing
 

@@ -6,9 +6,9 @@ import {
 import type { AgentSession } from "../types";
 import { useCoDesStore } from "../store";
 import {
-  attachNativeSession,
   isTauri,
   resizeNativeSession,
+  recordUsage,
   startNativeSession,
   stopNativeSession,
   writeNativeSession,
@@ -27,6 +27,15 @@ type Runtime = {
   approvalSeen: boolean;
   size: TerminalSize;
   generation: number;
+  inspectBuffer: string;
+  usage: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cachedTokens?: number;
+    reasoningTokens?: number;
+    totalTokens?: number;
+    costAmount?: number;
+  };
 };
 const runtimes = new Map<string, Runtime>();
 
@@ -73,7 +82,8 @@ function recordStatus(
 }
 
 function inspectOutput(runtime: Runtime, text: string) {
-  const clean = text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, " ");
+  const clean = `${runtime.inspectBuffer}${text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, " ")}`;
+  runtime.inspectBuffer = clean.slice(-2_000);
   if (
     !runtime.approvalSeen &&
     /(?:approval required|permission required|allow this action|proceed\?\s*\[?y\/n)/i.test(
@@ -116,6 +126,68 @@ function inspectOutput(runtime: Runtime, text: string) {
     useCoDesStore
       .getState()
       .updateSession(runtime.session.id, { cost: Number(cost[1]) });
+  const tokenPatterns = {
+    inputTokens: /(?:input|prompt)[ _-]?tokens?[: ]+([0-9][0-9,]*)/i,
+    outputTokens: /(?:output|completion)[ _-]?tokens?[: ]+([0-9][0-9,]*)/i,
+    cachedTokens: /(?:cached|cache read)[ _-]?(?:input )?tokens?[: ]+([0-9][0-9,]*)/i,
+    reasoningTokens: /(?:reasoning|thinking)[ _-]?tokens?[: ]+([0-9][0-9,]*)/i,
+    totalTokens: /total[ _-]?tokens?[: ]+([0-9][0-9,]*)/i,
+  } as const;
+  let usageChanged = false;
+  for (const [key, pattern] of Object.entries(tokenPatterns) as Array<
+    [keyof typeof runtime.usage, RegExp]
+  >) {
+    const match = clean.match(pattern);
+    if (!match) continue;
+    const value = Number(match[1].split(",").join(""));
+    if (Number.isFinite(value) && runtime.usage[key] !== value) {
+      runtime.usage[key] = value;
+      usageChanged = true;
+    }
+  }
+  if (cost) {
+    runtime.usage.costAmount = Number(cost[1]);
+    usageChanged = true;
+  }
+  if (usageChanged) {
+    const usage = runtime.usage;
+    void recordUsage({
+      id: `terminal:${runtime.session.id}`,
+      externalId: runtime.session.id,
+      provider: runtime.session.provider,
+      product: providerProduct(runtime.session.provider),
+      model: runtime.session.model,
+      projectId: runtime.session.projectId,
+      sessionId: runtime.session.id,
+      startedAt: runtime.session.startedAt ?? runtime.session.createdAt,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cachedTokens: usage.cachedTokens,
+      reasoningTokens: usage.reasoningTokens,
+      totalTokens:
+        usage.totalTokens ??
+        (usage.inputTokens !== undefined || usage.outputTokens !== undefined
+          ? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)
+          : undefined),
+      requestCount: 1,
+      costAmount: usage.costAmount,
+      costCurrency: usage.costAmount === undefined ? undefined : "USD",
+      source: `${runtime.session.provider}-terminal`,
+      sourceKind: "local_terminal",
+      confidence: "provider_reported",
+      syncedAt: Date.now(),
+    }).catch(() => undefined);
+  }
+}
+
+function providerProduct(provider: string) {
+  return provider === "claude"
+    ? "Claude Code"
+    : provider === "codex"
+      ? "Codex"
+      : provider === "opencode"
+        ? "OpenCode"
+        : provider;
 }
 
 function dispatch(runtime: Runtime, event: PtyEvent) {
@@ -151,26 +223,40 @@ async function ensure(runtime: Runtime) {
     const handler = (event: PtyEvent) => {
       if (runtime.generation === generation) dispatch(runtime, event);
     };
-    const attached = await attachNativeSession(runtime.session.id, handler);
-    if (!attached) {
-      useCoDesStore.getState().updateSession(runtime.session.id, {
-        status: "waiting",
-        startedAt: Date.now(),
-      });
-      const started = await startNativeSession(
-        {
-          sessionId: runtime.session.id,
-          provider: runtime.session.provider,
-          cwd: runtime.session.cwd,
-          resumeId: runtime.session.resumeId,
-          mode: runtime.session.mode,
-          model: runtime.session.model,
-          initialPrompt: runtime.session.initialPrompt,
-          ...runtime.size,
-        },
-        handler,
-      );
-      if (!started) return;
+    useCoDesStore.getState().updateSession(runtime.session.id, {
+      status: "waiting",
+      startedAt: Date.now(),
+    });
+    const created = await startNativeSession(
+      {
+        sessionId: runtime.session.id,
+        provider: runtime.session.provider,
+        cwd: runtime.session.cwd,
+        resumeId: runtime.session.resumeId,
+        mode: runtime.session.mode,
+        model: runtime.session.model,
+        initialPrompt: runtime.session.initialPrompt,
+        cliOverrides: runtime.session.cliProfileId
+          ? (() => {
+              const profile = useCoDesStore
+                .getState()
+                .cliProfiles.find(
+                  (item) => item.id === runtime.session.cliProfileId,
+                );
+              return profile
+                ? {
+                    executablePath: profile.executablePath,
+                    extraArgs: profile.extraArgs,
+                    environment: profile.environment,
+                  }
+                : undefined;
+            })()
+          : undefined,
+        ...runtime.size,
+      },
+      handler,
+    );
+    if (created) {
       useCoDesStore
         .getState()
         .addEvent({
@@ -218,6 +304,8 @@ function getRuntime(session: AgentSession, size?: TerminalSize) {
       approvalSeen: false,
       size: normalizeSize(size),
       generation: 0,
+      inspectBuffer: "",
+      usage: {},
     };
     runtimes.set(session.id, runtime);
   }

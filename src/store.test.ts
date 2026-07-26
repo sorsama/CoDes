@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { darkTheme, defaultSettings, normalizeWorkspaceSnapshot, useCoDesStore } from "./store";
+import { darkTheme, defaultSettings, normalizeWorkspaceSnapshot, useCoDesStore, workspaceSnapshot } from "./store";
 
 describe("workspace state", () => {
   beforeEach(() => useCoDesStore.setState({
@@ -47,7 +47,7 @@ describe("workspace state", () => {
       sessions: [], tasks: [], events: [], alerts: [], themes: [darkTheme], settings: defaultSettings,
       activeProjectId: "legacy", activeSessionId: "", activeThemeId: darkTheme.id, sessionLayout: "tabs",
     });
-    expect(snapshot.snapshotVersion).toBe(7);
+    expect(snapshot.snapshotVersion).toBe(9);
     expect(snapshot.workspaces).toHaveLength(1);
     expect(snapshot.projects[0].workspaceId).toBe(snapshot.workspaces[0].id);
     expect(snapshot.activeProjectId).toBe("legacy");
@@ -63,6 +63,51 @@ describe("workspace state", () => {
     expect(repaired.settings.handoffHistoryMode).toBe("conversation");
     expect(repaired.settings.handoffRecentTurns).toBe(50);
     expect(repaired.settings.handoffMaxChars).toBe(1_024);
+  });
+
+  it("migrates workflow defaults without converting existing tasks", () => {
+    const snapshot = normalizeWorkspaceSnapshot({
+      workspaces: [{ id: "w", name: "Work" }],
+      projects: [{ id: "p", workspaceId: "w", name: "Project", path: "C:\\p" }],
+      tasks: [{
+        id: "t",
+        projectId: "p",
+        title: "Existing task",
+        description: "",
+        column: "ready",
+        tags: [],
+        position: 0,
+      }],
+    });
+    expect(snapshot.workflowTemplates[0].id).toBe("plan-build-verify");
+    expect(snapshot.tasks[0].executionKind).toBe("single");
+    expect(snapshot.settings.defaultWorkflowTemplateId).toBe("plan-build-verify");
+  });
+
+  it("marks unfinished workflow runs interrupted during hydration", () => {
+    const snapshot = normalizeWorkspaceSnapshot({
+      workspaces: [{ id: "w", name: "Work" }],
+      projects: [{ id: "p", workspaceId: "w", name: "Project", path: "C:\\p" }],
+      tasks: [{
+        id: "t", projectId: "p", title: "Task", description: "", column: "working", tags: [], position: 0, executionKind: "workflow",
+      }],
+      workflowRuns: [{
+        id: "r", taskId: "t", projectId: "p", templateId: "plan-build-verify", templateName: "Flow", status: "running", cycle: 0, pauseAfterStage: false, createdAt: 1,
+        stageRuns: [{ id: "sr", stageId: "plan", name: "Plan", role: "plan", provider: "codex", status: "running", attempt: 1, cycle: 0 }],
+      }],
+    });
+    expect(snapshot.workflowRuns[0].status).toBe("interrupted");
+    expect(snapshot.workflowRuns[0].stageRuns[0].status).toBe("cancelled");
+  });
+
+  it("does not persist secret CLI literal values", () => {
+    useCoDesStore.setState({
+      cliProfiles: [{
+        id: "profile", name: "Private", provider: "codex", extraArgs: [],
+        environment: [{ name: "TOKEN", source: "literal", value: "secret", secret: true }],
+      }],
+    });
+    expect(workspaceSnapshot(useCoDesStore.getState()).cliProfiles[0].environment[0].value).toBeUndefined();
   });
 
   it("resolves a persisted failure alert after the session recovered", () => {

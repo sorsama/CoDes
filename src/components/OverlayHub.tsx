@@ -15,7 +15,7 @@ import {
 import { PROVIDER_IDS, providerMeta } from "../lib/providers";
 import { cachedTools, detectTools } from "../lib/native";
 import { sessionRuntime } from "../lib/sessionRuntime";
-import { dispatchBoardTask } from "../lib/taskAutomation";
+import { dispatchTask } from "../lib/taskAutomation";
 import { appConfirm } from "../lib/dialogs";
 import { ProviderIcon } from "./ProviderIcon";
 import { useCoDesStore } from "../store";
@@ -300,10 +300,17 @@ function AlertsPanel() {
 function SessionCreator() {
   const state = useCoDesStore();
   const project = state.projects.find((p) => p.id === state.activeProjectId);
+  const [executionKind, setExecutionKind] = useState<"single" | "workflow">(
+    "single",
+  );
   const [provider, setProvider] = useState<Provider>(
     state.settings.defaultProvider,
   );
   const [title, setTitle] = useState("New agent session");
+  const [request, setRequest] = useState("");
+  const [workflowTemplateId, setWorkflowTemplateId] = useState(
+    state.settings.defaultWorkflowTemplateId,
+  );
   const [cwd, setCwd] = useState(project?.path ?? "");
   const [resumeId, setResumeId] = useState("");
   const [mode, setMode] = useState<SessionMode>(
@@ -319,8 +326,50 @@ function SessionCreator() {
   }, []);
   const installed =
     tools.find((tool) => tool.provider === provider)?.installed ?? false;
+  const workflowTemplate = state.workflowTemplates.find(
+    (template) => template.id === workflowTemplateId,
+  );
+  const unavailableStages =
+    workflowTemplate?.stages.filter((stage) => {
+      const profile = stage.cliProfileId
+        ? state.cliProfiles.find((item) => item.id === stage.cliProfileId)
+        : undefined;
+      return (
+        !profile?.executablePath &&
+        !tools.find((tool) => tool.provider === stage.provider)?.installed
+      );
+    }) ?? [];
   async function create() {
     setError("");
+    if (executionKind === "workflow") {
+      if (!project) {
+        setError("Select a project before starting a workflow.");
+        return;
+      }
+      if (!workflowTemplate) {
+        setError("Select a valid workflow template.");
+        return;
+      }
+      const taskId = state.addTask("ready", {
+        projectId: project.id,
+        title: title.trim() || workflowTemplate.name,
+        description: request.trim(),
+        executionKind: "workflow",
+        workflowTemplateId: workflowTemplate.id,
+        autonomous: true,
+      });
+      const dispatch = dispatchTask(taskId);
+      const runId = useCoDesStore
+        .getState()
+        .tasks.find((task) => task.id === taskId)?.workflowRunId;
+      state.setOverlay(null);
+      if (runId) state.setActiveWorkflowRun(runId);
+      else state.setView("workflows");
+      void dispatch.catch(() => {
+        // The workflow runner persists its failure and guidance on the run.
+      });
+      return;
+    }
     const id = state.addSession(
       provider,
       title.trim() || providerMeta(provider).label,
@@ -340,12 +389,13 @@ function SessionCreator() {
       setError(String(e));
     }
   }
+  const isWorkflow = executionKind === "workflow";
   return (
-    <Backdrop label="New agent session">
+    <Backdrop label={isWorkflow ? "New workflow session" : "New agent session"}>
       <header className="overlay-heading">
         <div>
-          <span>Launch provider</span>
-          <h2>New session</h2>
+          <span>{isWorkflow ? "Coordinate agents" : "Launch provider"}</span>
+          <h2>{isWorkflow ? "New workflow" : "New session"}</h2>
         </div>
         <button
           className="icon-button"
@@ -356,58 +406,159 @@ function SessionCreator() {
         </button>
       </header>
       <div className="form-stack">
+        <fieldset className="execution-kind-picker">
+          <legend>Session type</legend>
+          <label className={!isWorkflow ? "active" : ""}>
+            <input
+              type="radio"
+              checked={!isWorkflow}
+              onChange={() => setExecutionKind("single")}
+            />
+            <span>
+              <strong>Single CLI</strong>
+              <small>Open one provider session</small>
+            </span>
+          </label>
+          <label className={isWorkflow ? "active" : ""}>
+            <input
+              type="radio"
+              checked={isWorkflow}
+              onChange={() => {
+                setExecutionKind("workflow");
+                if (title === "New agent session") setTitle("New workflow");
+              }}
+            />
+            <span>
+              <strong>Workflow</strong>
+              <small>Plan, build, verify, and repair</small>
+            </span>
+          </label>
+        </fieldset>
         <label>
-          <span>Provider</span>
-          <div className="provider-select">
-            <ProviderIcon provider={provider} />
-            <select
-              value={provider}
-              onChange={(e) => setProvider(e.target.value as Provider)}
-            >
-              {PROVIDER_IDS.map((id) => (
-                <option key={id} value={id}>
-                  {providerMeta(id).label}
-                </option>
-              ))}
-            </select>
-          </div>
-          <small>
-            {tools.length
-              ? installed
-                ? "Installed and ready"
-                : `${providerMeta(provider).install} · installation required`
-              : "Checking local tools…"}
-          </small>
-        </label>
-        <label>
-          <span>Session title</span>
+          <span>{isWorkflow ? "Workflow title" : "Session title"}</span>
           <input value={title} onChange={(e) => setTitle(e.target.value)} />
         </label>
-        <ModePicker value={mode} onChange={setMode} />
-        <label>
-          <span>
-            Model <em>optional</em>
-          </span>
-          <input
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            placeholder="Use provider default"
-          />
-        </label>
-        <label>
-          <span>Working directory</span>
-          <input value={cwd} onChange={(e) => setCwd(e.target.value)} />
-        </label>
-        <label>
-          <span>
-            Resume identifier <em>optional</em>
-          </span>
-          <input
-            value={resumeId}
-            onChange={(e) => setResumeId(e.target.value)}
-            placeholder="Provider session ID"
-          />
-        </label>
+        {isWorkflow ? (
+          <>
+            <label>
+              <span>Workflow template</span>
+              <select
+                value={workflowTemplateId}
+                onChange={(event) =>
+                  setWorkflowTemplateId(event.target.value)
+                }
+              >
+                {state.workflowTemplates.map((template) => (
+                  <option value={template.id} key={template.id}>
+                    {template.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {workflowTemplate && (
+              <div className="session-workflow-preview">
+                {workflowTemplate.stages.map((stage, index) => {
+                  const unavailable = unavailableStages.some(
+                    (item) => item.id === stage.id,
+                  );
+                  return (
+                    <div className="session-workflow-stage" key={stage.id}>
+                      <span>{index + 1}</span>
+                      <ProviderIcon provider={stage.provider} />
+                      <div>
+                        <strong>{stage.name}</strong>
+                        <small>
+                          {providerMeta(stage.provider).label} ·{" "}
+                          {unavailable ? "Setup required" : "Ready"}
+                        </small>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <label>
+              <span>What should the workflow do?</span>
+              <textarea
+                rows={6}
+                value={request}
+                onChange={(event) => setRequest(event.target.value)}
+                placeholder="Describe the result you want. The planning agent will inspect the project before implementation starts."
+              />
+            </label>
+            <label>
+              <span>Project</span>
+              <input value={project?.path ?? ""} readOnly />
+              <small>
+                Reports and stage sessions stay inside this project.
+              </small>
+            </label>
+            {tools.length > 0 && unavailableStages.length > 0 && (
+              <p className="form-error">
+                Install or configure{" "}
+                {[
+                  ...new Set(
+                    unavailableStages.map((stage) =>
+                      providerMeta(stage.provider).label,
+                    ),
+                  ),
+                ].join(", ")}{" "}
+                before starting this workflow.
+              </p>
+            )}
+          </>
+        ) : (
+          <>
+            <label>
+              <span>Provider</span>
+              <div className="provider-select">
+                <ProviderIcon provider={provider} />
+                <select
+                  value={provider}
+                  onChange={(e) => setProvider(e.target.value as Provider)}
+                >
+                  {PROVIDER_IDS.map((id) => (
+                    <option key={id} value={id}>
+                      {providerMeta(id).label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <small>
+                {tools.length
+                  ? installed
+                    ? "Installed and ready"
+                    : `${providerMeta(provider).install} · installation required`
+                  : "Checking local tools…"}
+              </small>
+            </label>
+            <ModePicker value={mode} onChange={setMode} />
+            <label>
+              <span>
+                Model <em>optional</em>
+              </span>
+              <input
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                placeholder="Use provider default"
+              />
+            </label>
+            <label>
+              <span>Working directory</span>
+              <input value={cwd} onChange={(e) => setCwd(e.target.value)} />
+            </label>
+            <label>
+              <span>
+                Resume identifier <em>optional</em>
+              </span>
+              <input
+                value={resumeId}
+                onChange={(e) => setResumeId(e.target.value)}
+                placeholder="Provider session ID"
+              />
+            </label>
+          </>
+        )}
         {error && <p className="form-error">{error}</p>}
       </div>
       <footer className="sheet-actions">
@@ -419,10 +570,17 @@ function SessionCreator() {
         </button>
         <button
           className="primary-button"
-          disabled={!cwd.trim() || (tools.length > 0 && !installed)}
+          disabled={
+            isWorkflow
+              ? !project ||
+                !title.trim() ||
+                !workflowTemplate ||
+                (tools.length > 0 && unavailableStages.length > 0)
+              : !cwd.trim() || (tools.length > 0 && !installed)
+          }
           onClick={() => void create()}
         >
-          Start session
+          {isWorkflow ? "Start workflow" : "Start session"}
         </button>
       </footer>
     </Backdrop>
@@ -445,6 +603,8 @@ function TaskEditor() {
         provider: state.settings.defaultProvider,
         mode: state.settings.defaultSessionMode,
         autonomous: true,
+        executionKind: "single",
+        workflowTemplateId: state.settings.defaultWorkflowTemplateId,
       },
   );
   const [error, setError] = useState("");
@@ -484,11 +644,24 @@ function TaskEditor() {
       });
     }
     try {
-      await dispatchBoardTask(taskId, {
+      const dispatched = dispatchTask(taskId, {
         provider: draft.provider,
         mode: draft.mode,
         model: draft.model,
       });
+      if (draft.executionKind === "workflow") {
+        const runId = useCoDesStore
+          .getState()
+          .tasks.find((task) => task.id === taskId)?.workflowRunId;
+        state.setOverlay(null);
+        if (runId) state.setActiveWorkflowRun(runId);
+        else state.setView("workflows");
+        void dispatched.catch(() => {
+          // Workflow failures are recorded on the run and shown in its workspace.
+        });
+        return;
+      }
+      await dispatched;
       state.setOverlay(null);
     } catch (e) {
       setError(String(e));
@@ -575,38 +748,153 @@ function TaskEditor() {
             ))}
           </select>
         </label>
-        <label>
-          <span>Dispatch provider</span>
-          <div className="provider-select">
-            <ProviderIcon
-              provider={draft.provider ?? state.settings.defaultProvider}
+        <fieldset className="execution-kind-picker">
+          <legend>Execution</legend>
+          <label className={draft.executionKind !== "workflow" ? "active" : ""}>
+            <input
+              type="radio"
+              checked={draft.executionKind !== "workflow"}
+              onChange={() => patch("executionKind", "single")}
             />
+            <span><strong>Single agent</strong><small>Run one provider session</small></span>
+          </label>
+          <label className={draft.executionKind === "workflow" ? "active" : ""}>
+            <input
+              type="radio"
+              checked={draft.executionKind === "workflow"}
+              onChange={() => patch("executionKind", "workflow")}
+            />
+            <span><strong>Workflow</strong><small>Plan, build, verify, and repair</small></span>
+          </label>
+        </fieldset>
+        {draft.executionKind === "workflow" ? (
+          <>
+          <label>
+            <span>Workflow template</span>
             <select
-              value={draft.provider ?? state.settings.defaultProvider}
-              onChange={(e) => patch("provider", e.target.value as Provider)}
+              value={
+                draft.workflowTemplateId ??
+                state.settings.defaultWorkflowTemplateId
+              }
+              onChange={(e) => patch("workflowTemplateId", e.target.value)}
             >
-              {PROVIDER_IDS.map((id) => (
-                <option value={id} key={id}>
-                  {providerMeta(id).label}
+              {state.workflowTemplates.map((template) => (
+                <option value={template.id} key={template.id}>
+                  {template.name}
                 </option>
               ))}
             </select>
-          </div>
-        </label>
-        <ModePicker
-          value={draft.mode ?? state.settings.defaultSessionMode}
-          onChange={(mode) => patch("mode", mode)}
-        />
-        <label>
-          <span>
-            Model <em>optional</em>
-          </span>
-          <input
-            value={draft.model ?? ""}
-            onChange={(e) => patch("model", e.target.value || undefined)}
-            placeholder="Use provider default"
-          />
-        </label>
+            <small className="workflow-stage-preview">
+              {state.workflowTemplates
+                .find(
+                  (item) =>
+                    item.id ===
+                    (draft.workflowTemplateId ??
+                      state.settings.defaultWorkflowTemplateId),
+                )
+                ?.stages.map((stage) => providerMeta(stage.provider).label)
+                .join(" → ")}
+            </small>
+          </label>
+          <details className="task-workflow-overrides">
+            <summary>Override stages for this task</summary>
+            {state.workflowTemplates
+              .find(
+                (item) =>
+                  item.id ===
+                  (draft.workflowTemplateId ??
+                    state.settings.defaultWorkflowTemplateId),
+              )
+              ?.stages.map((stage) => {
+                const override = draft.workflowOverrides?.[stage.id] ?? {};
+                const update = (value: Partial<typeof stage>) =>
+                  patch("workflowOverrides", {
+                    ...(draft.workflowOverrides ?? {}),
+                    [stage.id]: { ...override, ...value },
+                  });
+                return (
+                  <div className="task-stage-override" key={stage.id}>
+                    <ProviderIcon
+                      provider={override.provider ?? stage.provider}
+                    />
+                    <strong>{stage.name}</strong>
+                    <select
+                      aria-label={`${stage.name} provider`}
+                      value={override.provider ?? stage.provider}
+                      onChange={(event) =>
+                        update({ provider: event.target.value as Provider })
+                      }
+                    >
+                      {PROVIDER_IDS.map((provider) => (
+                        <option value={provider} key={provider}>
+                          {providerMeta(provider).label}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      aria-label={`${stage.name} mode`}
+                      value={override.mode ?? stage.mode}
+                      onChange={(event) =>
+                        update({ mode: event.target.value as SessionMode })
+                      }
+                    >
+                      {SESSION_MODES.map((mode) => (
+                        <option value={mode.id} key={mode.id}>
+                          {mode.label}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      aria-label={`${stage.name} model`}
+                      value={override.model ?? stage.model ?? ""}
+                      placeholder="Default model"
+                      onChange={(event) =>
+                        update({ model: event.target.value || undefined })
+                      }
+                    />
+                  </div>
+                );
+              })}
+          </details>
+          </>
+        ) : (
+          <>
+            <label>
+              <span>Dispatch provider</span>
+              <div className="provider-select">
+                <ProviderIcon
+                  provider={draft.provider ?? state.settings.defaultProvider}
+                />
+                <select
+                  value={draft.provider ?? state.settings.defaultProvider}
+                  onChange={(e) =>
+                    patch("provider", e.target.value as Provider)
+                  }
+                >
+                  {PROVIDER_IDS.map((id) => (
+                    <option value={id} key={id}>
+                      {providerMeta(id).label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </label>
+            <ModePicker
+              value={draft.mode ?? state.settings.defaultSessionMode}
+              onChange={(mode) => patch("mode", mode)}
+            />
+            <label>
+              <span>
+                Model <em>optional</em>
+              </span>
+              <input
+                value={draft.model ?? ""}
+                onChange={(e) => patch("model", e.target.value || undefined)}
+                placeholder="Use provider default"
+              />
+            </label>
+          </>
+        )}
         <label className="automation-toggle">
           <input
             type="checkbox"

@@ -9,14 +9,22 @@ import type {
   AppSettings,
   AppTheme,
   BoardTask,
+  CliProfile,
   Project,
   TimelineEvent,
   ViewId,
   Workspace,
   WorkspaceAlert,
   WorkspaceSnapshot,
+  WorkflowRun,
+  WorkflowTemplate,
 } from "./types";
 import type { Provider } from "./lib/providers";
+import {
+  defaultWorkflowTemplate,
+  DEFAULT_WORKFLOW_ID,
+  normalizeWorkflowTemplate,
+} from "./lib/workflowModel";
 
 export const darkTheme: AppTheme = {
   id: "codes-dark",
@@ -93,6 +101,13 @@ export const defaultSettings: AppSettings = {
   handoffRecentTurns: 10,
   handoffMaxChars: 64_000,
   handoffRedactSecrets: true,
+  defaultWorkflowTemplateId: DEFAULT_WORKFLOW_ID,
+  gitAutomationMode: "verify_first",
+  gitDefaultProvider: "codex",
+  gitDefaultProfileId: undefined,
+  gitProtectedBranches: ["main", "master", "develop", "release/*"],
+  usageRefreshMinutes: 0,
+  usageBudgetUsd: undefined,
 };
 
 export interface CoDesState extends WorkspaceSnapshot {
@@ -101,6 +116,7 @@ export interface CoDesState extends WorkspaceSnapshot {
   hydrated: boolean;
   overlay: "search" | "alerts" | "session" | "task" | "workspaces" | null;
   editingTaskId?: string;
+  activeWorkflowRunId?: string;
   message?: string;
   pendingInvite?: string;
   setView: (view: ViewId) => void;
@@ -109,6 +125,7 @@ export interface CoDesState extends WorkspaceSnapshot {
   setOverlay: (overlay: CoDesState["overlay"], editingTaskId?: string) => void;
   setMessage: (message?: string) => void;
   setPendingInvite: (invite?: string) => void;
+  setActiveWorkflowRun: (id?: string) => void;
   setActiveWorkspace: (id: string) => void;
   addWorkspace: (workspace: Workspace) => void;
   updateWorkspace: (id: string, patch: Partial<Workspace>) => void;
@@ -157,15 +174,26 @@ export interface CoDesState extends WorkspaceSnapshot {
   removeTheme: (id: string) => void;
   setActiveTheme: (id: string) => void;
   updateSettings: (patch: Partial<AppSettings>) => void;
+  addWorkflowTemplate: (template?: Partial<WorkflowTemplate>) => string;
+  updateWorkflowTemplate: (id: string, patch: Partial<WorkflowTemplate>) => void;
+  duplicateWorkflowTemplate: (id: string) => string;
+  removeWorkflowTemplate: (id: string) => void;
+  addWorkflowRun: (run: WorkflowRun) => void;
+  updateWorkflowRun: (id: string, patch: Partial<WorkflowRun>) => void;
+  updateCliProfile: (profile: CliProfile) => void;
+  removeCliProfile: (id: string) => void;
 }
 
 const initial: WorkspaceSnapshot = {
-  snapshotVersion: 7,
+  snapshotVersion: 9,
   workspaces: [defaultWorkspace],
   activeWorkspaceId: defaultWorkspace.id,
   projects: [defaultProject],
   sessions: [],
   tasks: [],
+  workflowTemplates: [defaultWorkflowTemplate],
+  workflowRuns: [],
+  cliProfiles: [],
   events: [],
   alerts: [],
   themes: [darkTheme, lightTheme],
@@ -289,8 +317,54 @@ export function normalizeWorkspaceSnapshot(input: unknown): WorkspaceSnapshot {
         Math.max(recoveredAt.get(event.sessionId) ?? 0, event.timestamp),
       );
   });
-  const tasks = asArray<BoardTask>(source.tasks).filter((item) =>
-    projectIds.has(item.projectId),
+  const tasks = asArray<BoardTask>(source.tasks)
+    .filter((item) => projectIds.has(item.projectId))
+    .map((item) => ({
+      ...item,
+      executionKind:
+        item.executionKind === "workflow"
+          ? ("workflow" as const)
+          : ("single" as const),
+    }));
+  const taskIds = new Set(tasks.map((item) => item.id));
+  const workflowTemplates = asArray<Partial<WorkflowTemplate>>(
+    source.workflowTemplates,
+  ).map((item) => normalizeWorkflowTemplate(item));
+  if (!workflowTemplates.some((item) => item.id === DEFAULT_WORKFLOW_ID))
+    workflowTemplates.unshift(defaultWorkflowTemplate);
+  const workflowRuns = asArray<WorkflowRun>(source.workflowRuns)
+    .filter(
+      (item) =>
+        projectIds.has(item.projectId) &&
+        taskIds.has(item.taskId) &&
+        workflowTemplates.some((template) => template.id === item.templateId),
+    )
+    .map((item) =>
+      ["queued", "preflight", "running", "repairing", "waiting_input"].includes(
+        item.status,
+      )
+        ? {
+            ...item,
+            status: "interrupted" as const,
+            error: "CoDes closed before the workflow stage finished.",
+            stageRuns: item.stageRuns.map((stage) =>
+              stage.status === "running"
+                ? {
+                    ...stage,
+                    status: "cancelled" as const,
+                    finishedAt: now,
+                    error: "Interrupted when CoDes closed.",
+                  }
+                : stage,
+            ),
+          }
+        : item,
+    );
+  const cliProfiles = asArray<CliProfile>(source.cliProfiles).filter(
+    (item) =>
+      typeof item.id === "string" &&
+      typeof item.name === "string" &&
+      typeof item.provider === "string",
   );
   const alerts = asArray<WorkspaceAlert>(source.alerts)
     .filter((item) => projectIds.has(item.projectId))
@@ -338,13 +412,38 @@ export function normalizeWorkspaceSnapshot(input: unknown): WorkspaceSnapshot {
     1,
     Math.min(8, Number(settings.taskConcurrency) || 2),
   );
+  settings.gitAutomationMode =
+    settings.gitAutomationMode === "full_auto" ? "full_auto" : "verify_first";
+  settings.gitDefaultProvider =
+    typeof settings.gitDefaultProvider === "string"
+      ? settings.gitDefaultProvider
+      : defaultSettings.gitDefaultProvider;
+  settings.gitProtectedBranches = Array.isArray(settings.gitProtectedBranches)
+    ? settings.gitProtectedBranches
+        .filter((branch): branch is string => typeof branch === "string")
+        .map((branch) => branch.trim())
+        .filter(Boolean)
+    : [...defaultSettings.gitProtectedBranches];
+  settings.usageRefreshMinutes = Math.max(
+    0,
+    Math.min(1_440, Number(settings.usageRefreshMinutes) || 0),
+  );
+  if (
+    !workflowTemplates.some(
+      (template) => template.id === settings.defaultWorkflowTemplateId,
+    )
+  )
+    settings.defaultWorkflowTemplateId = DEFAULT_WORKFLOW_ID;
   return {
-    snapshotVersion: 7,
+    snapshotVersion: 9,
     workspaces,
     activeWorkspaceId,
     projects,
     sessions,
     tasks,
+    workflowTemplates,
+    workflowRuns,
+    cliProfiles,
     events,
     alerts,
     themes: themes.length ? themes : [darkTheme, lightTheme],
@@ -378,12 +477,15 @@ export const useCoDesStore = create<CoDesState>()(
       sidebarOpen: true,
       hydrated: false,
       overlay: null,
+      activeWorkflowRunId: undefined,
       setView: (view) => set({ view }),
       toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
       setOverlay: (overlay, editingTaskId) => set({ overlay, editingTaskId }),
       setMessage: (message) => set({ message }),
       setPendingInvite: (pendingInvite) =>
         set({ pendingInvite, view: pendingInvite ? "sharing" : get().view }),
+      setActiveWorkflowRun: (activeWorkflowRunId) =>
+        set({ activeWorkflowRunId, view: "workflows" }),
       hydrate: (snapshot) => {
         const normalized = normalizeWorkspaceSnapshot(snapshot);
         set({
@@ -761,13 +863,13 @@ export const useCoDesStore = create<CoDesState>()(
           const tasks =
             next?.status === "completed"
               ? s.tasks.map((task) =>
-                  task.sessionId === id
+                  task.sessionId === id && task.executionKind !== "workflow"
                     ? { ...task, column: "done" as const, failure: undefined }
                     : task,
                 )
               : next?.status === "failed"
                 ? s.tasks.map((task) =>
-                    task.sessionId === id
+                    task.sessionId === id && task.executionKind !== "workflow"
                       ? { ...task, failure: "Linked session failed" }
                       : task,
                   )
@@ -787,6 +889,7 @@ export const useCoDesStore = create<CoDesState>()(
               column,
               tags: [],
               position: s.tasks.filter((task) => task.column === column).length,
+              executionKind: "single",
               ...patch,
             },
           ],
@@ -914,10 +1017,111 @@ export const useCoDesStore = create<CoDesState>()(
       setActiveTheme: (activeThemeId) => set({ activeThemeId }),
       updateSettings: (patch) =>
         set((s) => ({ settings: { ...s.settings, ...patch } })),
+      addWorkflowTemplate: (patch = {}) => {
+        const id = patch.id ?? crypto.randomUUID();
+        set((s) => ({
+          workflowTemplates: [
+            ...s.workflowTemplates,
+            normalizeWorkflowTemplate({
+              ...defaultWorkflowTemplate,
+              ...patch,
+              id,
+              name: patch.name ?? "New workflow",
+              builtIn: false,
+              updatedAt: Date.now(),
+            }),
+          ],
+        }));
+        return id;
+      },
+      updateWorkflowTemplate: (id, patch) =>
+        set((s) => ({
+          workflowTemplates: s.workflowTemplates.map((item) =>
+            item.id === id
+              ? normalizeWorkflowTemplate({
+                  ...item,
+                  ...patch,
+                  id,
+                  builtIn: item.builtIn,
+                  updatedAt: Date.now(),
+                })
+              : item,
+          ),
+        })),
+      duplicateWorkflowTemplate: (id) => {
+        const nextId = crypto.randomUUID();
+        set((s) => {
+          const source = s.workflowTemplates.find((item) => item.id === id);
+          return source
+            ? {
+                workflowTemplates: [
+                  ...s.workflowTemplates,
+                  normalizeWorkflowTemplate({
+                    ...source,
+                    id: nextId,
+                    name: `${source.name} copy`,
+                    builtIn: false,
+                    stages: source.stages.map((stage) => ({
+                      ...stage,
+                      id: crypto.randomUUID(),
+                    })),
+                    updatedAt: Date.now(),
+                  }),
+                ],
+              }
+            : {};
+        });
+        return nextId;
+      },
+      removeWorkflowTemplate: (id) =>
+        set((s) => {
+          const template = s.workflowTemplates.find((item) => item.id === id);
+          if (!template || template.builtIn) return {};
+          return {
+            workflowTemplates: s.workflowTemplates.filter(
+              (item) => item.id !== id,
+            ),
+            settings: {
+              ...s.settings,
+              defaultWorkflowTemplateId:
+                s.settings.defaultWorkflowTemplateId === id
+                  ? DEFAULT_WORKFLOW_ID
+                  : s.settings.defaultWorkflowTemplateId,
+            },
+          };
+        }),
+      addWorkflowRun: (run) =>
+        set((s) => ({ workflowRuns: [...s.workflowRuns, run] })),
+      updateWorkflowRun: (id, patch) =>
+        set((s) => ({
+          workflowRuns: s.workflowRuns.map((item) =>
+            item.id === id ? { ...item, ...patch } : item,
+          ),
+        })),
+      updateCliProfile: (profile) =>
+        set((s) => ({
+          cliProfiles: s.cliProfiles.some((item) => item.id === profile.id)
+            ? s.cliProfiles.map((item) =>
+                item.id === profile.id ? profile : item,
+              )
+            : [...s.cliProfiles, profile],
+        })),
+      removeCliProfile: (id) =>
+        set((s) => ({
+          cliProfiles: s.cliProfiles.filter((item) => item.id !== id),
+          workflowTemplates: s.workflowTemplates.map((template) => ({
+            ...template,
+            stages: template.stages.map((stage) =>
+              stage.cliProfileId === id
+                ? { ...stage, cliProfileId: undefined }
+                : stage,
+            ),
+          })),
+        })),
     }),
     {
       name: "codes-workspace-v4",
-      version: 7,
+      version: 9,
       storage: createJSONStorage(fallbackStorage),
       migrate: (persisted) => normalizeWorkspaceSnapshot(persisted),
       partialize: (s) => ({
@@ -929,6 +1133,7 @@ export const useCoDesStore = create<CoDesState>()(
         editingTaskId: undefined,
         message: undefined,
         pendingInvite: undefined,
+        activeWorkflowRunId: undefined,
       }),
     },
   ),
@@ -949,6 +1154,9 @@ export function workspaceSnapshot(state: CoDesState): WorkspaceSnapshot {
     projects,
     sessions,
     tasks,
+    workflowTemplates,
+    workflowRuns,
+    cliProfiles,
     events,
     alerts,
     themes,
@@ -965,6 +1173,16 @@ export function workspaceSnapshot(state: CoDesState): WorkspaceSnapshot {
     projects,
     sessions,
     tasks,
+    workflowTemplates,
+    workflowRuns,
+    cliProfiles: cliProfiles.map((profile) => ({
+      ...profile,
+      environment: profile.environment.map((item) =>
+        item.secret && item.source === "literal"
+          ? { ...item, value: undefined }
+          : item,
+      ),
+    })),
     events,
     alerts,
     themes,

@@ -1,4 +1,6 @@
+mod git_manager;
 mod history;
+mod usage;
 
 use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -10,9 +12,9 @@ use std::{
     ffi::OsString,
     fs,
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -33,9 +35,9 @@ struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, SessionHandle>>>,
 }
 
-struct AppState {
+pub(crate) struct AppState {
     sessions: SessionManager,
-    database: Mutex<Connection>,
+    pub(crate) database: Mutex<Connection>,
     app_data_dir: PathBuf,
 }
 
@@ -105,7 +107,58 @@ impl AppState {
                    snapshot_json TEXT NOT NULL,
                    updated_at INTEGER NOT NULL
                  );
-                 INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, datetime('now'));",
+                 INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, datetime('now'));
+                 CREATE TABLE IF NOT EXISTS usage_records(
+                   id TEXT PRIMARY KEY,
+                   external_id TEXT,
+                   provider TEXT NOT NULL,
+                   product TEXT NOT NULL,
+                   model TEXT,
+                   workspace_id TEXT,
+                   project_id TEXT,
+                   session_id TEXT,
+                   started_at INTEGER NOT NULL,
+                   ended_at INTEGER,
+                   input_tokens INTEGER,
+                   output_tokens INTEGER,
+                   cached_tokens INTEGER,
+                   reasoning_tokens INTEGER,
+                   total_tokens INTEGER,
+                   request_count INTEGER,
+                   cost_amount REAL,
+                   cost_currency TEXT,
+                   native_unit TEXT,
+                   native_quantity REAL,
+                   source TEXT NOT NULL,
+                   source_kind TEXT NOT NULL,
+                   confidence TEXT NOT NULL,
+                   synced_at INTEGER NOT NULL,
+                   UNIQUE(source, external_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_usage_records_started_at ON usage_records(started_at DESC);
+                 CREATE INDEX IF NOT EXISTS idx_usage_records_provider ON usage_records(provider, started_at DESC);
+                 CREATE TABLE IF NOT EXISTS usage_connectors(
+                   id TEXT PRIMARY KEY,
+                   kind TEXT NOT NULL,
+                   label TEXT NOT NULL,
+                   enabled INTEGER NOT NULL DEFAULT 0,
+                   account_id TEXT,
+                   project_id TEXT,
+                   organization_id TEXT,
+                   cursor TEXT,
+                   last_synced_at INTEGER,
+                   last_error TEXT,
+                   updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS git_operation_audit(
+                   id TEXT PRIMARY KEY,
+                   repository_path TEXT NOT NULL,
+                   operation_json TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   detail TEXT,
+                   occurred_at INTEGER NOT NULL
+                 );
+                 INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, datetime('now'));",
             )
             .map_err(|error| error.to_string())?;
         Ok(Self {
@@ -131,6 +184,23 @@ struct StartSessionRequest {
     initial_prompt: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
+    cli_overrides: Option<CliOverrides>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliOverrides {
+    executable_path: Option<String>,
+    extra_args: Vec<String>,
+    environment: Vec<CliEnvironmentOverride>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliEnvironmentOverride {
+    name: String,
+    source: String,
+    value: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -219,6 +289,7 @@ fn antigravity_executable() -> PathBuf {
 }
 
 /// How a provider translates a stored session `resume_id` into CLI arguments.
+#[derive(Clone, Copy)]
 enum ResumeMode {
     /// Positional subcommand, e.g. codex: `resume <id>`.
     SubcommandPositional(&'static str),
@@ -236,6 +307,7 @@ enum Binary {
     Resolved(fn() -> PathBuf),
 }
 
+#[derive(Clone)]
 struct ResolvedBinary {
     program: PathBuf,
     prefix_args: Vec<OsString>,
@@ -343,6 +415,19 @@ impl Binary {
     }
 }
 
+static PROVIDER_BINARY_CACHE: OnceLock<Mutex<HashMap<&'static str, ResolvedBinary>>> =
+    OnceLock::new();
+
+fn resolve_provider_binary(spec: &'static ProviderSpec, refresh: bool) -> ResolvedBinary {
+    let cache = PROVIDER_BINARY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if !refresh && let Some(binary) = cache.lock().get(spec.id).cloned() {
+        return binary;
+    }
+    let binary = spec.binary.resolve();
+    cache.lock().insert(spec.id, binary.clone());
+    binary
+}
+
 /// Launch/detection specification for one agent provider CLI.
 struct ProviderSpec {
     id: &'static str,
@@ -354,11 +439,11 @@ struct ProviderSpec {
 }
 
 /// Provider-specific non-interactive entry point used by autonomous board tasks.
+#[derive(Clone, Copy)]
 enum AutonomousMode {
     Subcommand(&'static str),
     Flag(&'static str),
     FlagWithPrompt(&'static str),
-    Positional,
 }
 
 /// Single source of truth for supported agent providers.
@@ -400,8 +485,8 @@ const PROVIDERS: &[ProviderSpec] = &[
         id: "reasonix",
         binary: Binary::Named("reasonix"),
         base_args: &[],
-        resume: ResumeMode::FlagWithId("--resume"),
-        autonomous: AutonomousMode::Positional,
+        resume: ResumeMode::FlagWithId("--session"),
+        autonomous: AutonomousMode::Subcommand("run"),
         model_arg: Some("--model"),
     },
     ProviderSpec {
@@ -467,7 +552,21 @@ fn sanitize_provider_environment(command: &mut CommandBuilder) {
 fn provider_command(request: &StartSessionRequest) -> Result<CommandBuilder, String> {
     let spec = find_provider(&request.provider)
         .ok_or_else(|| format!("unsupported provider: {}", request.provider))?;
-    let mut command = spec.binary.resolve().command_builder();
+    let binary = if let Some(path) = request
+        .cli_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.executable_path.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() || !path.is_file() {
+            return Err("CLI executable override must be an existing absolute file".into());
+        }
+        ResolvedBinary::direct(path)
+    } else {
+        resolve_provider_binary(spec, false)
+    };
+    let mut command = binary.command_builder();
     let autonomous_prompt = request
         .initial_prompt
         .as_deref()
@@ -475,8 +574,7 @@ fn provider_command(request: &StartSessionRequest) -> Result<CommandBuilder, Str
     if autonomous_prompt.is_some() {
         match spec.autonomous {
             AutonomousMode::Subcommand(subcommand) => command.arg(subcommand),
-            AutonomousMode::Flag(flag) => command.arg(flag),
-            AutonomousMode::FlagWithPrompt(_) | AutonomousMode::Positional => {}
+            AutonomousMode::Flag(_) | AutonomousMode::FlagWithPrompt(_) => {}
         };
     } else if let Some(resume_id) = &request.resume_id {
         match spec.resume {
@@ -562,13 +660,39 @@ fn provider_command(request: &StartSessionRequest) -> Result<CommandBuilder, Str
         },
         mode => return Err(format!("unsupported session mode: {mode}")),
     }
+    if let Some(overrides) = &request.cli_overrides {
+        command.args(&overrides.extra_args);
+    }
     if let Some(prompt) = autonomous_prompt {
-        if let AutonomousMode::FlagWithPrompt(flag) = spec.autonomous {
-            command.arg(flag);
+        match spec.autonomous {
+            AutonomousMode::Flag(flag) | AutonomousMode::FlagWithPrompt(flag) => {
+                command.arg(flag);
+            }
+            AutonomousMode::Subcommand(_) => {}
         }
         command.arg(prompt);
     }
     sanitize_provider_environment(&mut command);
+    if let Some(overrides) = &request.cli_overrides {
+        for item in &overrides.environment {
+            let name = item.name.trim();
+            if name.is_empty()
+                || name.contains('=')
+                || (name.starts_with("CODEX_") && name != "CODEX_HOME")
+            {
+                return Err(format!("protected or invalid environment variable: {name}"));
+            }
+            match item.source.as_str() {
+                "inherit" => {
+                    if let Some(value) = env::var_os(name) {
+                        command.env(name, value);
+                    }
+                }
+                "literal" => command.env(name, item.value.as_deref().unwrap_or_default()),
+                _ => return Err(format!("unsupported environment source for {name}")),
+            };
+        }
+    }
     command.cwd(&request.cwd);
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
@@ -580,10 +704,10 @@ fn start_session(
     request: StartSessionRequest,
     on_event: Channel<PtyEvent>,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if let Some(existing) = state.sessions.sessions.lock().get_mut(&request.session_id) {
         existing.listeners.lock().push(on_event);
-        return Ok(());
+        return Ok(false);
     }
     if !PathBuf::from(&request.cwd).is_dir() {
         return Err(format!("working directory does not exist: {}", request.cwd));
@@ -724,7 +848,7 @@ fn start_session(
             }
         }
     });
-    Ok(())
+    Ok(true)
 }
 
 #[tauri::command]
@@ -838,12 +962,97 @@ fn tool_status(provider: &str, binary: ResolvedBinary) -> ToolStatus {
 
 #[tauri::command]
 fn detect_tools() -> Vec<ToolStatus> {
-    let mut tools: Vec<ToolStatus> = PROVIDERS
-        .iter()
-        .map(|spec| tool_status(spec.id, spec.binary.resolve()))
-        .collect();
-    tools.push(tool_status("github", resolve_named_binary("gh")));
-    tools
+    thread::scope(|scope| {
+        let provider_checks: Vec<_> = PROVIDERS
+            .iter()
+            .map(|spec| {
+                scope.spawn(move || tool_status(spec.id, resolve_provider_binary(spec, true)))
+            })
+            .collect();
+        let github_check = scope.spawn(|| tool_status("github", resolve_named_binary("gh")));
+        let mut tools: Vec<ToolStatus> = provider_checks
+            .into_iter()
+            .map(|check| check.join().expect("provider detection thread panicked"))
+            .collect();
+        tools.push(
+            github_check
+                .join()
+                .expect("GitHub CLI detection thread panicked"),
+        );
+        tools
+    })
+}
+
+#[tauri::command]
+fn probe_cli(
+    provider: String,
+    executable_path: Option<String>,
+    extra_args: Vec<String>,
+) -> Result<ToolStatus, String> {
+    let spec =
+        find_provider(&provider).ok_or_else(|| format!("unsupported provider: {provider}"))?;
+    let binary = if let Some(path) = executable_path.filter(|value| !value.trim().is_empty()) {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() || !path.is_file() {
+            return Err("CLI executable override must be an existing absolute file".into());
+        }
+        ResolvedBinary::direct(path)
+    } else {
+        resolve_provider_binary(spec, true)
+    };
+    let mut command = binary.std_command();
+    command.args(extra_args);
+    command.arg("--version");
+    let output = command.output().map_err(|error| error.to_string())?;
+    Ok(ToolStatus {
+        provider,
+        installed: output.status.success(),
+        version: output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string()),
+        authenticated: None,
+    })
+}
+
+#[tauri::command]
+fn write_workflow_report(
+    project_root: String,
+    relative_path: String,
+    content: String,
+) -> Result<String, String> {
+    let root = PathBuf::from(project_root)
+        .canonicalize()
+        .map_err(|error| format!("invalid project root: {error}"))?;
+    let relative = PathBuf::from(relative_path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err("report path must stay inside the project".into());
+    }
+    let destination = root.join(relative);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "report path has no parent".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = destination.with_extension(format!(
+        "{}.tmp",
+        destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("md")
+    ));
+    fs::write(&temporary, content).map_err(|error| error.to_string())?;
+    if destination.exists() {
+        fs::remove_file(&destination).map_err(|error| error.to_string())?;
+    }
+    fs::rename(&temporary, &destination).map_err(|error| error.to_string())?;
+    Ok(destination.to_string_lossy().into_owned())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1138,11 +1347,25 @@ pub fn run() {
             prepare_handoff_history,
             delete_session_transcript,
             detect_tools,
+            probe_cli,
+            write_workflow_report,
             list_projects,
             save_project,
             load_workspace,
             save_workspace,
             inspect_repository,
+            git_manager::git_repository_state,
+            git_manager::git_diff,
+            git_manager::git_execute,
+            git_manager::git_create_review_prompt,
+            git_manager::git_delete_review_prompt,
+            usage::usage_connectors,
+            usage::save_usage_connector,
+            usage::delete_usage_credential,
+            usage::record_usage,
+            usage::query_usage,
+            usage::sync_local_usage,
+            usage::sync_usage_connector,
             browser_control
         ])
         .run(tauri::generate_context!())
@@ -1164,7 +1387,7 @@ mod tests {
                 row.get(0)
             })
             .expect("migration version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[test]
@@ -1209,6 +1432,7 @@ mod tests {
             initial_prompt: None,
             cols: None,
             rows: None,
+            cli_overrides: None,
         };
         assert!(provider_command(&request).is_err());
     }
@@ -1226,6 +1450,7 @@ mod tests {
                 initial_prompt: None,
                 cols: Some(80),
                 rows: Some(24),
+                cli_overrides: None,
             };
             assert!(
                 provider_command(&request).is_ok(),
@@ -1233,6 +1458,82 @@ mod tests {
                 spec.id
             );
         }
+    }
+
+    #[test]
+    fn reasonix_uses_headless_run_and_named_sessions() {
+        let spec = find_provider("reasonix").expect("reasonix provider");
+        assert!(matches!(spec.autonomous, AutonomousMode::Subcommand("run")));
+        assert!(matches!(spec.resume, ResumeMode::FlagWithId("--session")));
+    }
+
+    #[test]
+    fn antigravity_places_print_immediately_before_its_prompt() {
+        let prompt = "return structured git proposal";
+        let request = StartSessionRequest {
+            session_id: "test".into(),
+            provider: "antigravity".into(),
+            cwd: ".".into(),
+            resume_id: None,
+            mode: Some("plan".into()),
+            model: None,
+            initial_prompt: Some(prompt.into()),
+            cols: None,
+            rows: None,
+            cli_overrides: None,
+        };
+        let command = provider_command(&request).expect("Antigravity command");
+        let arguments: Vec<String> = command
+            .get_argv()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        let print = arguments
+            .iter()
+            .position(|value| value == "--print")
+            .expect("print flag");
+        let mode = arguments
+            .iter()
+            .position(|value| value == "--mode")
+            .expect("mode flag");
+        assert!(mode < print);
+        assert_eq!(arguments.get(print + 1).map(String::as_str), Some(prompt));
+    }
+
+    #[test]
+    fn provider_command_rejects_protected_environment_overrides() {
+        let request = StartSessionRequest {
+            session_id: "test".into(),
+            provider: "codex".into(),
+            cwd: ".".into(),
+            resume_id: None,
+            mode: Some("plan".into()),
+            model: None,
+            initial_prompt: Some("Plan this".into()),
+            cols: None,
+            rows: None,
+            cli_overrides: Some(CliOverrides {
+                executable_path: None,
+                extra_args: vec![],
+                environment: vec![CliEnvironmentOverride {
+                    name: "CODEX_THREAD_ID".into(),
+                    source: "literal".into(),
+                    value: Some("unsafe".into()),
+                }],
+            }),
+        };
+        assert!(provider_command(&request).is_err());
+    }
+
+    #[test]
+    fn workflow_report_rejects_parent_traversal() {
+        let root = env::temp_dir();
+        let result = write_workflow_report(
+            root.to_string_lossy().into_owned(),
+            "../outside.md".into(),
+            "report".into(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

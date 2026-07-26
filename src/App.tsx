@@ -19,6 +19,7 @@ import { z } from "zod";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import {
   Activity,
+  ArrowRightLeft,
   Blocks,
   Bot,
   Check,
@@ -59,6 +60,9 @@ import { BrowserWorkspace } from "./components/BrowserWorkspace";
 import { AppDialogHost } from "./components/AppDialogHost";
 import { OverlayHub } from "./components/OverlayHub";
 import { ProviderIcon } from "./components/ProviderIcon";
+import { WorkflowHub } from "./components/WorkflowHub";
+import { GitWorkspace } from "./components/GitWorkspace";
+import { UsageInspector } from "./components/UsageInspector";
 import { ProjectManagerDialog } from "./components/ProjectManagerDialog";
 import { TerminalPane } from "./components/TerminalPane";
 import {
@@ -82,7 +86,7 @@ import { initializePersistence } from "./lib/persistence";
 import { appPrompt } from "./lib/dialogs";
 import { providerMeta, PROVIDER_IDS } from "./lib/providers";
 import { sessionRuntime } from "./lib/sessionRuntime";
-import { dispatchBoardTask } from "./lib/taskAutomation";
+import { dispatchTask } from "./lib/taskAutomation";
 import { LiveShareSession, type ShareSnapshot } from "./sharing/client";
 import { activeTheme, darkTheme, lightTheme, useCoDesStore } from "./store";
 import type {
@@ -101,6 +105,8 @@ const nav: Array<{ id: ViewId; label: string; icon: typeof LayoutDashboard }> =
     { id: "dashboard", label: "Overview", icon: LayoutDashboard },
     { id: "sessions", label: "Sessions", icon: TerminalSquare },
     { id: "board", label: "Task board", icon: KanbanSquare },
+    { id: "workflows", label: "Workflows", icon: ArrowRightLeft },
+    { id: "git", label: "Git", icon: GitCommit },
     { id: "browser", label: "Browser", icon: MonitorDot },
     { id: "inspector", label: "Inspector", icon: Activity },
     { id: "sharing", label: "Live share", icon: Share2 },
@@ -320,6 +326,7 @@ function Topbar({ title, eyebrow }: { title: string; eyebrow?: string }) {
 }
 
 function RepositoryWidget({ path }: { path: string }) {
+  const app = useCoDesStore();
   const [repo, setRepo] = useState<RepositoryOverview>();
   const [loading, setLoading] = useState(true);
   const load = () => {
@@ -339,13 +346,21 @@ function RepositoryWidget({ path }: { path: string }) {
           <span className="eyebrow">Repository</span>
           <h2>GitHub activity</h2>
         </div>
-        <button
-          className="icon-button"
-          onClick={load}
-          aria-label="Refresh repository"
-        >
-          <RefreshCw size={15} />
-        </button>
+        <div>
+          <button
+            className="widget-text-action"
+            onClick={() => app.setView("git")}
+          >
+            Open Git
+          </button>
+          <button
+            className="icon-button"
+            onClick={load}
+            aria-label="Refresh repository"
+          >
+            <RefreshCw size={15} />
+          </button>
+        </div>
       </div>
       {loading ? (
         <div className="widget-empty">
@@ -801,9 +816,24 @@ function SortableTask({ task }: { task: BoardTask }) {
           <span>
             {task.autonomous ? <Zap /> : <CircleDot />}
             {task.autonomous
-              ? `${providerMeta(task.provider ?? state.settings.defaultProvider).label} · ${(task.mode ?? state.settings.defaultSessionMode).replace("_", " ")}`
+              ? task.executionKind === "workflow"
+                ? state.workflowTemplates.find(
+                    (item) =>
+                      item.id ===
+                      (task.workflowTemplateId ??
+                        state.settings.defaultWorkflowTemplateId),
+                  )?.name ?? "Workflow"
+                : `${providerMeta(task.provider ?? state.settings.defaultProvider).label} · ${(task.mode ?? state.settings.defaultSessionMode).replace("_", " ")}`
               : "Unassigned"}
           </span>
+        )}
+        {task.workflowRunId && (
+          <button
+            className="task-run-link"
+            onClick={() => state.setActiveWorkflowRun(task.workflowRunId)}
+          >
+            View run
+          </button>
         )}
         <button
           aria-label={`Edit ${task.title}`}
@@ -1076,6 +1106,7 @@ function Inspector() {
     </main>
   );
 }
+void Inspector;
 
 const themeSchema = z.object({
   name: z.string().min(1).max(80),
@@ -1720,6 +1751,98 @@ function SettingsView() {
               </option>
             </select>
           </label>
+          <label className="setting-field">
+            <span>Default workflow</span>
+            <select
+              value={state.settings.defaultWorkflowTemplateId}
+              onChange={(e) =>
+                state.updateSettings({
+                  defaultWorkflowTemplateId: e.target.value,
+                })
+              }
+            >
+              {state.workflowTemplates.map((template) => (
+                <option value={template.id} key={template.id}>
+                  {template.name}
+                </option>
+              ))}
+            </select>
+            <small>Tasks can choose a different template before dispatch.</small>
+          </label>
+          <h2 className="settings-subheading">Git automation</h2>
+          <label className="setting-field">
+            <span>AI Git authority</span>
+            <select
+              value={state.settings.gitAutomationMode}
+              onChange={(e) =>
+                state.updateSettings({
+                  gitAutomationMode: e.target.value as
+                    | "verify_first"
+                    | "full_auto",
+                })
+              }
+            >
+              <option value="verify_first">Verify every proposal</option>
+              <option value="full_auto">Full auto with safety stops</option>
+            </select>
+            <small>
+              Force pushes, destructive resets, protected branches, conflicts,
+              and suspected secrets always stop.
+            </small>
+          </label>
+          <label className="setting-field">
+            <span>Protected branches</span>
+            <input
+              value={state.settings.gitProtectedBranches.join(", ")}
+              onChange={(e) =>
+                state.updateSettings({
+                  gitProtectedBranches: e.target.value
+                    .split(",")
+                    .map((branch) => branch.trim())
+                    .filter(Boolean),
+                })
+              }
+              placeholder="main, master, develop, release/*"
+            />
+          </label>
+          <label className="setting-field">
+            <span>Inspector USD budget</span>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={state.settings.usageBudgetUsd ?? ""}
+              onChange={(e) =>
+                state.updateSettings({
+                  usageBudgetUsd:
+                    e.target.value === ""
+                      ? undefined
+                      : Math.max(0, Number(e.target.value) || 0),
+                })
+              }
+              placeholder="No local budget"
+            />
+            <small>
+              Alerts compare only exact provider-reported USD costs.
+            </small>
+          </label>
+          <label className="setting-field">
+            <span>Inspector refresh interval</span>
+            <select
+              value={state.settings.usageRefreshMinutes}
+              onChange={(e) =>
+                state.updateSettings({
+                  usageRefreshMinutes: Number(e.target.value),
+                })
+              }
+            >
+              <option value={0}>Manual only</option>
+              <option value={15}>Every 15 minutes</option>
+              <option value={30}>Every 30 minutes</option>
+              <option value={60}>Every hour</option>
+            </select>
+            <small>Refresh runs only while Inspector is open.</small>
+          </label>
           <h2 className="settings-subheading">Task board autonomy</h2>
           <label className="setting-toggle">
             <span>
@@ -1849,6 +1972,8 @@ function App() {
   const state = useCoDesStore();
   const theme = activeTheme(state);
   const launchingTasks = useRef(new Set<string>());
+  const gitVisited = useRef(state.view === "git");
+  if (state.view === "git") gitVisited.current = true;
   useEffect(() => {
     void initializePersistence().catch((e) =>
       state.setMessage(`Could not load workspace: ${String(e)}`),
@@ -1895,8 +2020,20 @@ function App() {
     if (!state.hydrated || !state.settings.taskBoardAutonomy || !isTauri())
       return;
     const activeCount = state.tasks.filter((task) => {
-      if (!task.autonomous || task.column !== "working" || !task.sessionId)
+      if (!task.autonomous || task.column !== "working")
         return false;
+      if (task.executionKind === "workflow" && task.workflowRunId) {
+        const run = state.workflowRuns.find(
+          (item) => item.id === task.workflowRunId,
+        );
+        return (
+          run &&
+          ["queued", "preflight", "running", "waiting_input", "repairing"].includes(
+            run.status,
+          )
+        );
+      }
+      if (!task.sessionId) return false;
       const session = state.sessions.find((item) => item.id === task.sessionId);
       return (
         session &&
@@ -1917,7 +2054,7 @@ function App() {
       .slice(0, capacity);
     queued.forEach((task) => {
       launchingTasks.current.add(task.id);
-      void dispatchBoardTask(task.id)
+      void dispatchTask(task.id)
         .catch((error) =>
           useCoDesStore.getState().updateTask(task.id, {
             failure: String(error),
@@ -1932,14 +2069,21 @@ function App() {
     state.settings.taskConcurrency,
     state.tasks,
     state.sessions,
+    state.workflowRuns,
   ]);
   const content =
     state.view === "sessions" ? (
       <Sessions />
     ) : state.view === "board" ? (
       <TaskBoard />
+    ) : state.view === "workflows" ? (
+      <WorkflowHub
+        topbar={<Topbar title="Workflows" eyebrow="Plan, build, verify" />}
+      />
     ) : state.view === "inspector" ? (
-      <Inspector />
+      <UsageInspector
+        topbar={<Topbar title="Inspector" eyebrow="Usage evidence ledger" />}
+      />
     ) : state.view === "themes" ? (
       <ThemeStudio />
     ) : state.view === "sharing" ? (
@@ -1956,7 +2100,14 @@ function App() {
       </a>
       <Sidebar />
       <section id="workspace" className="workspace">
-        {state.view !== "browser" && content}
+        {state.view !== "browser" && state.view !== "git" && content}
+        {gitVisited.current && (
+          <div className="git-view-host" hidden={state.view !== "git"}>
+            <GitWorkspace
+              topbar={<Topbar title="Git" eyebrow="Repository workbench" />}
+            />
+          </div>
+        )}
         <BrowserWorkspace
           active={state.view === "browser"}
           topbar={<Topbar title="Browser" eyebrow="Inspect and prompt" />}
